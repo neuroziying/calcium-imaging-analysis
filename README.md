@@ -1,2 +1,2 @@
 # calcium-imaging-analysis
-for in-lab use.
+Processing and analysis pipeline for large-scale calcium imaging datasets.
