@@ -15,12 +15,31 @@
 #                │           ├── decision
 #                │
 #                └── col_name
-
+#
+#
+# [CALL]
+# 
+#           paths = [
+#               "full_path",
+#               "full_path",
+#               ...]
+#
+#           labels_session = ['dataset_name1', 'dataset_name2', '...']
+#           save_dir = "your_save_path"
+#           os.makedirs(save_dir, exist_ok=True)
+#            
+#           framerate = 30 
+#           datasets = [multiregion_precompute(p, framerate) for p in paths]
+#
+#
+#
+#
 
 def multiregion_precompute(datafile_path, fr=30):
     import numpy as np
     import pandas as pd
     from dataclasses import dataclass
+    from typing import Optional
 
     @dataclass
     class BoutAct:
@@ -30,10 +49,10 @@ def multiregion_precompute(datafile_path, fr=30):
 
     @dataclass
     class TrialData:
-        drink: list
-        press: list
-        delay: list
-        decision: list
+        drink: Optional[BoutAct]
+        press: Optional[BoutAct]
+        delay: Optional[BoutAct]
+        decision: Optional[BoutAct]
 
     @dataclass
     class NeuralData:
@@ -41,121 +60,126 @@ def multiregion_precompute(datafile_path, fr=30):
         trials: list
         col_name: list
 
-    # load data 
+    # =========================
+    # load datasets
+    # =========================
     data = pd.read_excel(datafile_path)
-    
-    trial = data['trial'].values
-    press_bout = data['press bout'].values
-    drink_bout = data['drink bout'].values
     data.columns = data.columns.str.strip().str.lower()
+
+    press_bout = pd.to_numeric(data['press bout'], errors='coerce').fillna(0).astype(int).values
+    drink_bout = pd.to_numeric(data['drink bout'], errors='coerce').fillna(0).astype(int).values
+
     col_name = data.columns[5:].tolist()
+    cal = data.iloc[:, 5:].values.T
 
-    cal = data.iloc[:, 5:].values.T   # col 6 ~ col 20 in this exp.
+    T = cal.shape[1]
 
-    # trial segmentation: if index changes, cut into pieces.
-    change = trial[1:] != trial[:-1]
-    change = np.insert(change, 0, True)
-    label = np.cumsum(change)
+    # =========================
+    # detection: bouts
+    # =========================
+    def detect_bout(signal):
+        start = np.where((signal[1:] - signal[:-1]) == 1)[0]
+        end   = np.where((signal[1:] - signal[:-1]) == -1)[0]
 
+        # add "start" when series started by "1"
+        if signal[0] == 1:
+            start = np.insert(start, 0, 0)
+
+        # add "end" when series ended by "1"
+        if signal[-1] == 1:
+            end = np.append(end, len(signal)-1)
+
+        # length alignment
+        n = min(len(start), len(end))
+        start = start[:n]
+        end   = end[:n]
+
+        return start, end
+
+    press_start, press_end = detect_bout(press_bout)
+    drink_start, drink_end = detect_bout(drink_bout)
+
+    # =========================
+    # construct trial
+    # =========================
     trials = []
+    n_press = len(press_start)
+    drink_ptr = 0
 
-    for t in np.unique(label):
-        idx = np.where(label == t)[0]
+    
+    pending_decision = None
+    for i in range(n_press):
 
-        cal_t = cal[:, idx]
-        press_t = press_bout[idx]
-        drink_t = drink_bout[idx]
+        ps = press_start[i]
+        pe = press_end[i]
 
-        # detect bouts
-        press_start = np.where((press_t[1:] - press_t[:-1]) == 1)[0]
-        press_end   = np.where((press_t[1:] - press_t[:-1]) == -1)[0]
+        # ===== decision section for this trial =====
+        decision_bout_obj = pending_decision
+        pending_decision = None  # delete after used
 
-        drink_start = np.where((drink_t[1:] - drink_t[:-1]) == 1)[0]
-        drink_end   = np.where((drink_t[1:] - drink_t[:-1]) == -1)[0]
+        # ===== decide: press =====
+        s = max(ps - 4*fr, 0)
+        e = min(ps + 4*fr, T-1)
+        press_bout_obj = BoutAct(cal[:, s:e], s, e)
 
-        press_list = []
-        for s, e in zip(press_start, press_end):
-            s = max(s - 4*fr, 0)
-            e = min(s + 4*fr, cal_t.shape[1]-1)
-            press_list.append(BoutAct(
-                caltrace=cal_t[:, s:e],
-                start=s,
-                end=e))
+        drink_bout_obj = None
+        delay_bout_obj = None
 
-        drink_list = []
-        for s, e in zip(drink_start, drink_end):
-            s = max(s - 4*fr, 0)
-            e = min(s + 4*fr, cal_t.shape[1]-1)
-            drink_list.append(BoutAct(
-                caltrace=cal_t[:, s:e],
-                start=s,
-                end=e))
+        # ===== decide: drink =====
+        while drink_ptr < len(drink_start) and drink_start[drink_ptr] <= pe:
+            drink_ptr += 1
 
-        # delay: press_end → drink_start
-        delay_list = []
-        for pe, ds in zip(press_end, drink_start):
-            if ds > pe:
-                # prevent data pollution from events
-                margin = int(1 * fr)
+        has_drink = False
 
-                s = pe + margin
-                e = ds - margin
+        if drink_ptr < len(drink_start):
+            ds = drink_start[drink_ptr]
+            de = drink_end[drink_ptr]
 
-                if e > s:
-                    delay_list.append(
-                        BoutAct(
-                            caltrace=cal_t[:, s:e],
-                            start=s,
-                            end=e
-                        )
-                    )
+            next_ps = press_start[i+1] if i+1 < n_press else T
 
-        # decision: drink_end → next press_start
-        decision_list = []
+            if pe < ds < next_ps:
+                has_drink = True
 
-        n_drink = len(drink_end)
+        # ===== case A：have drink session =====
+        if has_drink:
 
-        for i in range(n_drink):
+            margin = int(1 * fr)
+            s_delay = pe + margin
+            e_delay = ds - margin
 
-            de = drink_end[i]
+            if e_delay > s_delay:
+                delay_bout_obj = BoutAct(cal[:, s_delay:e_delay], s_delay, e_delay)
 
-            # case: press again
-            if i + 1 < len(press_start):
-                ps = press_start[i + 1]
+            s = max(ds - 4*fr, 0)
+            e = min(ds + 4*fr, T-1)
+            drink_bout_obj = BoutAct(cal[:, s:e], s, e)
 
-                if ps > de:
-                    s = de + int(1 * fr)
-                    e = ps - int(1 * fr)
+            # generate decision section for next trial session
+            s_dec = pe
+            e_dec = de
 
-                    if e > s:
-                        decision_list.append(
-                            BoutAct(
-                                caltrace=cal_t[:, s:e],
-                                start=s,
-                                end=e
-                            )
-                        )
+            if e_dec > s_dec:
+                pending_decision = BoutAct(cal[:, s_dec:e_dec], s_dec, e_dec)
 
-            # case: lick -> end of the trial
-            else:
-                s = de + int(1 * fr)
-                e = cal_t.shape[1]
+            drink_ptr += 1
 
-                if e > s:
-                    decision_list.append(
-                        BoutAct(
-                            caltrace=cal_t[:, s:e],
-                            start=s,
-                            end=e
-                        )
-                    )
+        # ===== case B：no existing drink session =====
+        else:
+            if i + 1 < n_press:
+                next_ps = press_start[i+1]
 
-        # build trial 
+                s_dec = pe
+                e_dec = next_ps
+
+                if e_dec > s_dec:
+                    pending_decision = BoutAct(cal[:, s_dec:e_dec], s_dec, e_dec)
+
+        # construct class: trial
         trial_data = TrialData(
-            drink=drink_list,
-            press=press_list,
-            delay=delay_list,
-            decision=decision_list
+            decision=decision_bout_obj,
+            press=press_bout_obj,
+            delay=delay_bout_obj,
+            drink=drink_bout_obj
         )
 
         trials.append(trial_data)
@@ -163,5 +187,5 @@ def multiregion_precompute(datafile_path, fr=30):
     return NeuralData(
         num_trial=len(trials),
         trials=trials,
-        col_name = col_name
+        col_name=col_name
     )
